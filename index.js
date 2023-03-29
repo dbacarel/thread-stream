@@ -195,6 +195,85 @@ function onWorkerExit (code) {
   destroy(stream, code !== 0 ? new Error('the worker thread exited') : null)
 }
 
+/**
+ * A ThreadStream is an abstraction layer between a data producer and a Stream running in a worker thread.
+ * It provides a simple Stream-like interface (write, end) while internally it spawns a
+ * worker thread that deals directly with a target Stream provided to the constructor.
+ *
+ *
+ * This allows the producer to interact syncronously with ThreadStream while asyncronously sending data to
+ * the target Stream.
+ *
+ * ***************** COMMUNICATION ******************
+ * The communication between main and worker thread is implemented via shared buffers (no direct postMessage calls).
+ * On each iteration of the event-loop, the worker checks if new data was pushed by the main thread.
+ * The are 2 buffers being used:
+ *
+ *  **** STATE BUFFER (2^7 bytes) ****
+ *    This buffer holds 2 values that act as cursor for the data buffer:
+ *    - state[WRITE_INDEX]: keeps track of the data that has yet to be written into the target Stream (WRITE_INDEX)
+ *    - state[READ_INDEX] : keeps track of the data that has to be read (READ_INDEX)
+ *
+ *    For example:
+ *    [T=0]
+ *    state = [0, 0, 0, 0]        DATA = [0, 0, .., 0]
+ *                ^     ^                 ^READ
+ *              WRITE  READ                WRITE
+ *
+ *    [T=t, on ThreadStream.write('foo')]
+ *    state = [0, 2, 0, 0]        DATA = ['F', 'O', 'O', ...,  0]
+ *                ^     ^                  0    1    2
+ *              WRITE  READ                ^READ     ^WRITE
+ *
+ *    The WRITE cursor value is 2, meaning, we need to write the content of the data buffer up to byte at index 2.
+ *    According to whether it's possible to write all the content of the data buffer into the target stream or not
+ *    the READ cursor value is updated accordingly.
+ *    If it was possible to write only up to the 2nd byte, the buffers would look as follow:
+ *
+ *    STATE = [0, 2, 0, 1]        DATA = ['F', 'O', 'O', ...,  0]
+ *                ^     ^                  0    1    2
+ *              WRITE  READ                     ^READ^WRITE
+ *
+ *    If State[WRITE_INDEX] == State[WRITE_INDEX] it means that no new data awaits to be written into the target stream
+ *
+ * STATE = [0, 2, 0, 2]        DATA = ['F', 'O', 'O', ...,  0]
+ *             ^     ^                  0    1    2
+ *           WRITE  READ                          ^ (WRITE & READ)
+ *
+ *  **** DATA BUFFER (2^22 bytes default) ****
+ *    // TODO: describe how data buffer is used
+ *
+ *
+ *
+ * ************* BACK-PRESSURE STRATEGY *************
+ *
+ *
+ *                               ┌─ThreadStream──────────────────────────────┬─▲─────┐
+ *                               │                                           │ │     │
+ *                               │                                           ▼ │     │
+ *                               │                                           d │     │
+ *         ┌─producer─┐          │       Communication via shared buffers.   a │     │
+ *         │          │  write   │         Worker checks for new data on     t │     │
+ *         │          ├──────────►        each iteration of the event loop   a │     │
+ *         │          │          │                                           + │     │
+ *         └──────────┘          │                                           s │     │
+ *                               │                                           t │     │
+ *                               │                                           a │     │
+ *                               │                                           t │     │
+ *                               │                                           e │     │
+ *                               │                                           │ │     │
+ *                               │        ┌─worker.js─────────run()->────────▼─┴─┐   │
+ *                               │  write │                                      │   │
+ *                               │   ┌────┤                                      │   │
+ *                               │   └────┼─────────►  Target stream             │   │
+ *                               │        │                                      │   │
+ *                               │        │                                      │   │
+ *                               │        └──────────────────────────────────────┘   │
+ *                               │                                                   │
+ *                               └───────────────────────────────────────────────────┘
+ *
+ *
+ */
 class ThreadStream extends EventEmitter {
   constructor (opts = {}) {
     super()
@@ -203,11 +282,18 @@ class ThreadStream extends EventEmitter {
       throw new Error('bufferSize must at least fit a 4-byte utf-8 char')
     }
 
+    // wth is kImpl?
     this[kImpl] = {}
-    this[kImpl].stateBuf = new SharedArrayBuffer(128)
+
+    // TODO: define purpose and usage of this[kImpl].state
+    this[kImpl].stateBuf = new SharedArrayBuffer(128) // why not just 8 bytes?
+    // We are using only 2 elements of the Int32Array (WRITE_INDEX, READ_INDEX), each takes 32-bits (8 bytes)
     this[kImpl].state = new Int32Array(this[kImpl].stateBuf)
+
+    // TODO: define purpose and usage of this[kImpl].data
     this[kImpl].dataBuf = new SharedArrayBuffer(opts.bufferSize || 4 * 1024 * 1024)
     this[kImpl].data = Buffer.from(this[kImpl].dataBuf)
+
     this[kImpl].sync = opts.sync || false
     this[kImpl].ending = false
     this[kImpl].ended = false
